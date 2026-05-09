@@ -1,0 +1,77 @@
+<template>
+    <lightning-card title="商談 一括承認" icon-name="standard:approval">
+        <div slot="actions">
+            <lightning-button-icon
+                icon-name="utility:refresh"
+                alternative-text="更新"
+                title="更新"
+                onclick={handleRefresh}
+                disabled={isLoading}>
+            </lightning-button-icon>
+        </div>
+
+        <div class="slds-p-horizontal_medium">
+            <template if:true={isLoading}>
+                <lightning-spinner alternative-text="処理中"></lightning-spinner>
+            </template>
+
+            <div class="slds-grid slds-gutters slds-wrap slds-p-bottom_small">
+                <div class="slds-col slds-size_1-of-1 slds-medium-size_2-of-3">
+                    <lightning-textarea
+                        label="コメント"
+                        value={comments}
+                        onchange={handleCommentsChange}
+                        max-length="1000"
+                        placeholder="承認/却下時のコメント（任意）">
+                    </lightning-textarea>
+                </div>
+                <div class="slds-col slds-size_1-of-1 slds-medium-size_1-of-3 slds-grid slds-grid_vertical-align-end slds-wrap">
+                    <div class="slds-text-body_regular slds-p-right_medium slds-p-bottom_x-small">
+                        {selectedCountLabel}
+                    </div>
+                    <lightning-button-group>
+                        <lightning-button
+                            label="一括承認"
+                            variant="success"
+                            onclick={handleApprove}
+                            disabled={actionDisabled}>
+                        </lightning-button>
+                        <lightning-button
+                            label="一括却下"
+                            variant="destructive"
+                            onclick={handleReject}
+                            disabled={actionDisabled}>
+                        </lightning-button>
+                    </lightning-button-group>
+                </div>
+            </div>
+
+            <template if:true={hasRows}>
+                <lightning-datatable
+                    key-field={keyField}
+                    data={rows}
+                    columns={columns}
+                    onrowselection={handleRowSelection}>
+                </lightning-datatable>
+            </template>
+            <template if:false={hasRows}>
+                <div class="slds-align_absolute-center slds-p-vertical_large slds-text-color_weak">
+                    保留中の承認依頼はありません。
+                </div>
+            </template>
+
+            <template if:true={hasErrors}>
+                <div class="slds-box slds-box_x-small slds-m-top_small slds-theme_warning">
+                    <p class="slds-text-title_bold slds-p-bottom_x-small">エラー詳細</p>
+                    <ul class="slds-list_dotted">
+                        <template for:each={errors} for:item="err">
+                            <li key={err.id}>
+                                <strong>{err.label}</strong>: {err.message}
+                            </li>
+                        </template>
+                    </ul>
+                </div>
+            </template>
+        </div>
+    </lightning-card>
+</template>
