@@ -1,14 +1,15 @@
 /**
  * Apex controller for the bulk approval LWCs.
  *
- * Exposes AuraEnabled methods for:
- *   - listing the running user's submittable Opportunities,
- *   - listing pending approval workitems assigned to the running user,
- *   - submitting Opportunities for approval in bulk,
- *   - approving / rejecting workitems in bulk.
+ * Generic across any sObject that has at least one active approval process.
+ * Object selection is data-driven from ProcessDefinition; per-object record
+ * queries are built dynamically using the entity's name field and (when
+ * available) OwnerId, so the same controller backs Opportunity, Account,
+ * custom objects, and so on.
  *
- * Approval calls go through Approval.process(...) with allOrNone=false so that
- * partial success is preserved and per-record errors can be returned to the UI.
+ * Approval calls go through Approval.process(...) with allOrNone=false so
+ * that partial success is preserved and per-record errors can be returned to
+ * the UI.
  */
 public with sharing class BulkApprovalController {
 
@@ -28,77 +29,202 @@ public with sharing class BulkApprovalController {
         }
     }
 
-    /** Row shown on the bulk submit screen. */
-    public class SubmittableOpportunity {
-        @AuraEnabled public Id id;
-        @AuraEnabled public String name;
-        @AuraEnabled public String accountName;
-        @AuraEnabled public String stageName;
-        @AuraEnabled public Decimal amount;
-        @AuraEnabled public Date closeDate;
-        @AuraEnabled public String ownerName;
+    /** Object descriptor surfaced to the object picker. */
+    public class ApprovalObject {
+        @AuraEnabled public String apiName;
+        @AuraEnabled public String label;
+
+        public ApprovalObject(String apiName, String label) {
+            this.apiName = apiName;
+            this.label = label;
+        }
     }
 
-    /** Row shown on the bulk approval screen. */
+    /** Submit-screen payload: object metadata + rows. */
+    public class SubmittableData {
+        @AuraEnabled public String objectApiName;
+        @AuraEnabled public String objectLabel;
+        @AuraEnabled public String nameField;
+        @AuraEnabled public Boolean hasOwner;
+        @AuraEnabled public List<RecordRow> rows;
+
+        public SubmittableData() {
+            this.rows = new List<RecordRow>();
+        }
+    }
+
+    /** Generic row used by the submit screen. */
+    public class RecordRow {
+        @AuraEnabled public Id id;
+        @AuraEnabled public String name;
+        @AuraEnabled public String ownerName;
+        @AuraEnabled public Datetime createdDate;
+        @AuraEnabled public Datetime lastModifiedDate;
+    }
+
+    /** Row used by the approval screen. */
     public class PendingApprovalRow {
         @AuraEnabled public Id workitemId;
         @AuraEnabled public Id recordId;
         @AuraEnabled public String name;
-        @AuraEnabled public String stageName;
-        @AuraEnabled public Decimal amount;
+        @AuraEnabled public String objectApiName;
+        @AuraEnabled public String objectLabel;
         @AuraEnabled public String submitterName;
         @AuraEnabled public Datetime submittedDate;
     }
 
     /**
-     * Returns Opportunities owned by the running user that are not currently in
-     * an in-flight approval process. "In-flight" is defined as having a
-     * ProcessInstance whose Status is 'Pending'.
+     * Returns the distinct list of objects that have at least one active
+     * approval process. Used to populate the object picker on both screens.
      */
     @AuraEnabled(cacheable=true)
-    public static List<SubmittableOpportunity> getSubmittableOpportunities(Integer maxRows) {
-        Integer limitRows = normalizeMaxRows(maxRows);
-        Id runningUserId = UserInfo.getUserId();
+    public static List<ApprovalObject> getApprovalEnabledObjects() {
+        Set<String> keys = new Set<String>();
+        for (ProcessDefinition pd : [
+            SELECT TableEnumOrId
+            FROM ProcessDefinition
+            WHERE Type = 'Approval' AND State = 'Active'
+            LIMIT 1000
+        ]) {
+            if (String.isNotBlank(pd.TableEnumOrId)) {
+                keys.add(pd.TableEnumOrId);
+            }
+        }
+        List<ApprovalObject> results = new List<ApprovalObject>();
+        if (keys.isEmpty()) {
+            return results;
+        }
 
-        Set<Id> pendingOppIds = new Set<Id>();
+        Map<String, Schema.SObjectType> globalDesc = Schema.getGlobalDescribe();
+        Set<String> unresolved = new Set<String>();
+        for (String key : keys) {
+            // Standard objects: TableEnumOrId equals the API name and resolves directly.
+            Schema.SObjectType sot = globalDesc.get(key);
+            if (sot != null) {
+                Schema.DescribeSObjectResult dsr = sot.getDescribe();
+                results.add(new ApprovalObject(dsr.getName(), dsr.getLabel()));
+            } else {
+                unresolved.add(key);
+            }
+        }
+
+        // Custom objects: TableEnumOrId is the 15-char object-type id which
+        // matches EntityDefinition.DurableId.
+        if (!unresolved.isEmpty()) {
+            for (EntityDefinition ed : [
+                SELECT QualifiedApiName, Label, DurableId
+                FROM EntityDefinition
+                WHERE DurableId IN :unresolved
+                LIMIT 200
+            ]) {
+                results.add(new ApprovalObject(ed.QualifiedApiName, ed.Label));
+            }
+        }
+
+        return sortByLabel(results);
+    }
+
+    /**
+     * Returns records of the given object that the running user can submit
+     * for approval — i.e. owned/created by them and not currently in a
+     * pending approval process.
+     */
+    @AuraEnabled(cacheable=true)
+    public static SubmittableData getSubmittableRecords(String objectApiName, Integer maxRows) {
+        if (String.isBlank(objectApiName)) {
+            throw new AuraHandledException('objectApiName は必須です');
+        }
+        Schema.SObjectType sot = Schema.getGlobalDescribe().get(objectApiName);
+        if (sot == null) {
+            throw new AuraHandledException('未知のオブジェクト: ' + objectApiName);
+        }
+        Schema.DescribeSObjectResult dsr = sot.getDescribe();
+        if (!dsr.isQueryable() || !dsr.isAccessible()) {
+            throw new AuraHandledException(dsr.getName() + ' を参照できません');
+        }
+
+        Integer limitRows = normalizeMaxRows(maxRows);
+        Id userId = UserInfo.getUserId();
+        String resolvedApi = dsr.getName();
+
+        Map<String, Schema.SObjectField> fields = dsr.fields.getMap();
+        String nameField = findNameField(fields);
+        Boolean hasOwner = fields.containsKey('OwnerId');
+        Boolean hasCreatedBy = fields.containsKey('CreatedById');
+
+        Set<Id> pendingIds = new Set<Id>();
         for (ProcessInstance pi : [
             SELECT TargetObjectId
             FROM ProcessInstance
             WHERE Status = 'Pending'
-              AND TargetObject.Type = 'Opportunity'
+              AND TargetObject.Type = :resolvedApi
             LIMIT 50000
         ]) {
-            pendingOppIds.add(pi.TargetObjectId);
+            pendingIds.add(pi.TargetObjectId);
         }
 
-        List<Opportunity> opps = [
-            SELECT Id, Name, StageName, Amount, CloseDate,
-                   Account.Name, Owner.Name
-            FROM Opportunity
-            WHERE OwnerId = :runningUserId
-              AND Id NOT IN :pendingOppIds
-            ORDER BY CloseDate ASC NULLS LAST, Name ASC
-            LIMIT :limitRows
-        ];
-
-        List<SubmittableOpportunity> rows = new List<SubmittableOpportunity>();
-        for (Opportunity o : opps) {
-            SubmittableOpportunity row = new SubmittableOpportunity();
-            row.id = o.Id;
-            row.name = o.Name;
-            row.accountName = o.Account != null ? o.Account.Name : null;
-            row.stageName = o.StageName;
-            row.amount = o.Amount;
-            row.closeDate = o.CloseDate;
-            row.ownerName = o.Owner != null ? o.Owner.Name : null;
-            rows.add(row);
+        List<String> selectFields = new List<String>{ 'Id' };
+        if (nameField != null) {
+            selectFields.add(nameField);
         }
-        return rows;
+        selectFields.add('CreatedDate');
+        selectFields.add('LastModifiedDate');
+        if (hasOwner) {
+            selectFields.add('OwnerId');
+            selectFields.add('Owner.Name');
+        }
+
+        String filterField;
+        if (hasOwner) {
+            filterField = 'OwnerId';
+        } else if (hasCreatedBy) {
+            filterField = 'CreatedById';
+        } else {
+            // Nothing safe to filter on — return empty rather than dump every record.
+            SubmittableData empty = new SubmittableData();
+            empty.objectApiName = resolvedApi;
+            empty.objectLabel = dsr.getLabel();
+            empty.nameField = nameField;
+            empty.hasOwner = false;
+            return empty;
+        }
+
+        String orderField = nameField != null ? nameField : 'CreatedDate';
+        String soql = 'SELECT ' + String.join(selectFields, ', ')
+            + ' FROM ' + resolvedApi
+            + ' WHERE ' + filterField + ' = :userId'
+            + (pendingIds.isEmpty() ? '' : ' AND Id NOT IN :pendingIds')
+            + ' ORDER BY ' + orderField + ' ASC NULLS LAST'
+            + ' LIMIT :limitRows';
+
+        List<SObject> records = Database.query(soql);
+
+        SubmittableData data = new SubmittableData();
+        data.objectApiName = resolvedApi;
+        data.objectLabel = dsr.getLabel();
+        data.nameField = nameField;
+        data.hasOwner = hasOwner;
+
+        for (SObject r : records) {
+            RecordRow row = new RecordRow();
+            row.id = (Id) r.get('Id');
+            row.name = nameField != null ? String.valueOf(r.get(nameField)) : (String) r.get('Id');
+            row.createdDate = (Datetime) r.get('CreatedDate');
+            row.lastModifiedDate = (Datetime) r.get('LastModifiedDate');
+            if (hasOwner) {
+                SObject owner = r.getSObject('Owner');
+                if (owner != null) {
+                    row.ownerName = (String) owner.get('Name');
+                }
+            }
+            data.rows.add(row);
+        }
+        return data;
     }
 
     /**
-     * Submits the given Opportunity records to their default approval process.
-     * Uses allOrNone=false so partial success is honoured.
+     * Submits the given records to their default approval process.
+     * Works for any sObject; allOrNone=false preserves partial success.
      */
     @AuraEnabled
     public static List<BulkResult> submitForApproval(List<Id> recordIds, String comments) {
@@ -141,61 +267,97 @@ public with sharing class BulkApprovalController {
     }
 
     /**
-     * Returns approval workitems pending action by the running user where the
-     * target object is an Opportunity.
-     *
-     * Note: ProcessInstanceWorkitem.ActorId resolves either to a User Id or a
-     * Group Id (queue / role). Only direct user assignment is filtered here;
-     * delegation via groups is intentionally out of scope for this sample.
+     * Returns approval workitems pending action by the running user across
+     * all object types — or filtered to one object when objectApiName is
+     * supplied. Each row carries the resolved record name and object label.
      */
     @AuraEnabled(cacheable=true)
-    public static List<PendingApprovalRow> getMyPendingOpportunityApprovals() {
-        Id runningUserId = UserInfo.getUserId();
+    public static List<PendingApprovalRow> getMyPendingApprovals(String objectApiName) {
+        Id userId = UserInfo.getUserId();
+        Boolean filterByType = String.isNotBlank(objectApiName);
+        String typeFilter = objectApiName;
 
-        List<ProcessInstanceWorkitem> workitems = [
-            SELECT Id, ActorId,
-                   ProcessInstance.TargetObjectId,
-                   ProcessInstance.CreatedDate,
-                   ProcessInstance.SubmittedBy.Name,
-                   ProcessInstance.TargetObject.Type
-            FROM ProcessInstanceWorkitem
-            WHERE ActorId = :runningUserId
-              AND ProcessInstance.Status = 'Pending'
-            ORDER BY ProcessInstance.CreatedDate DESC
-            LIMIT 1000
-        ];
-
-        Set<Id> oppIds = new Set<Id>();
-        for (ProcessInstanceWorkitem w : workitems) {
-            if (w.ProcessInstance.TargetObject.Type == 'Opportunity') {
-                oppIds.add(w.ProcessInstance.TargetObjectId);
-            }
+        List<ProcessInstanceWorkitem> workitems;
+        if (filterByType) {
+            workitems = [
+                SELECT Id,
+                       ProcessInstance.TargetObjectId,
+                       ProcessInstance.CreatedDate,
+                       ProcessInstance.SubmittedBy.Name,
+                       ProcessInstance.TargetObject.Type
+                FROM ProcessInstanceWorkitem
+                WHERE ActorId = :userId
+                  AND ProcessInstance.Status = 'Pending'
+                  AND ProcessInstance.TargetObject.Type = :typeFilter
+                ORDER BY ProcessInstance.CreatedDate DESC
+                LIMIT 1000
+            ];
+        } else {
+            workitems = [
+                SELECT Id,
+                       ProcessInstance.TargetObjectId,
+                       ProcessInstance.CreatedDate,
+                       ProcessInstance.SubmittedBy.Name,
+                       ProcessInstance.TargetObject.Type
+                FROM ProcessInstanceWorkitem
+                WHERE ActorId = :userId
+                  AND ProcessInstance.Status = 'Pending'
+                ORDER BY ProcessInstance.CreatedDate DESC
+                LIMIT 1000
+            ];
         }
 
-        Map<Id, Opportunity> oppById = new Map<Id, Opportunity>();
-        if (!oppIds.isEmpty()) {
-            oppById = new Map<Id, Opportunity>([
-                SELECT Id, Name, StageName, Amount
-                FROM Opportunity
-                WHERE Id IN :oppIds
-            ]);
+        // Bucket target ids by object type for one query per type.
+        Map<String, Set<Id>> idsByType = new Map<String, Set<Id>>();
+        for (ProcessInstanceWorkitem w : workitems) {
+            String t = w.ProcessInstance.TargetObject.Type;
+            if (!idsByType.containsKey(t)) {
+                idsByType.put(t, new Set<Id>());
+            }
+            idsByType.get(t).add(w.ProcessInstance.TargetObjectId);
+        }
+
+        Map<String, Schema.SObjectType> globalDesc = Schema.getGlobalDescribe();
+        Map<Id, Map<String, String>> recordInfoById = new Map<Id, Map<String, String>>();
+
+        for (String t : idsByType.keySet()) {
+            Schema.SObjectType sot = globalDesc.get(t);
+            if (sot == null) {
+                continue;
+            }
+            Schema.DescribeSObjectResult dsr = sot.getDescribe();
+            if (!dsr.isQueryable() || !dsr.isAccessible()) {
+                continue;
+            }
+            String nameField = findNameField(dsr.fields.getMap());
+            Set<Id> ids = idsByType.get(t);
+            String soql = 'SELECT Id'
+                + (nameField != null ? ', ' + nameField : '')
+                + ' FROM ' + t + ' WHERE Id IN :ids';
+            for (SObject so : Database.query(soql)) {
+                Map<String, String> meta = new Map<String, String>();
+                meta.put('name', nameField != null
+                    ? String.valueOf(so.get(nameField))
+                    : (String) so.get('Id'));
+                meta.put('objectApiName', t);
+                meta.put('objectLabel', dsr.getLabel());
+                recordInfoById.put((Id) so.get('Id'), meta);
+            }
         }
 
         List<PendingApprovalRow> rows = new List<PendingApprovalRow>();
         for (ProcessInstanceWorkitem w : workitems) {
-            if (w.ProcessInstance.TargetObject.Type != 'Opportunity') {
-                continue;
-            }
-            Opportunity o = oppById.get(w.ProcessInstance.TargetObjectId);
-            if (o == null) {
+            Id targetId = w.ProcessInstance.TargetObjectId;
+            Map<String, String> meta = recordInfoById.get(targetId);
+            if (meta == null) {
                 continue;
             }
             PendingApprovalRow row = new PendingApprovalRow();
             row.workitemId = w.Id;
-            row.recordId = o.Id;
-            row.name = o.Name;
-            row.stageName = o.StageName;
-            row.amount = o.Amount;
+            row.recordId = targetId;
+            row.name = meta.get('name');
+            row.objectApiName = meta.get('objectApiName');
+            row.objectLabel = meta.get('objectLabel');
             row.submitterName = w.ProcessInstance.SubmittedBy != null
                 ? w.ProcessInstance.SubmittedBy.Name : null;
             row.submittedDate = w.ProcessInstance.CreatedDate;
@@ -262,6 +424,16 @@ public with sharing class BulkApprovalController {
         return Math.min(requested, ABSOLUTE_MAX_ROWS);
     }
 
+    private static String findNameField(Map<String, Schema.SObjectField> fields) {
+        for (Schema.SObjectField f : fields.values()) {
+            Schema.DescribeFieldResult d = f.getDescribe();
+            if (d.isNameField()) {
+                return d.getName();
+            }
+        }
+        return null;
+    }
+
     private static String formatErrors(Database.Error[] errors) {
         if (errors == null || errors.size() == 0) {
             return 'Unknown error';
@@ -271,5 +443,24 @@ public with sharing class BulkApprovalController {
             parts.add(err.getMessage());
         }
         return String.join(parts, '; ');
+    }
+
+    private static List<ApprovalObject> sortByLabel(List<ApprovalObject> input) {
+        Map<String, List<ApprovalObject>> byKey = new Map<String, List<ApprovalObject>>();
+        List<String> keys = new List<String>();
+        for (ApprovalObject o : input) {
+            String key = ((o.label == null ? '' : o.label.toLowerCase())) + '|' + o.apiName;
+            if (!byKey.containsKey(key)) {
+                byKey.put(key, new List<ApprovalObject>());
+                keys.add(key);
+            }
+            byKey.get(key).add(o);
+        }
+        keys.sort();
+        List<ApprovalObject> sorted = new List<ApprovalObject>();
+        for (String k : keys) {
+            sorted.addAll(byKey.get(k));
+        }
+        return sorted;
     }
 }

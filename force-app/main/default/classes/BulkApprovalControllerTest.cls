@@ -2,11 +2,11 @@
  * Tests for BulkApprovalController.
  *
  * The org running these tests must have an active approval process on
- * Opportunity for Approval.process() to succeed. The tests therefore guard
+ * Opportunity for Approval.process() to succeed end-to-end. The tests guard
  * against the no-process configuration: when Approval.process() fails because
- * no process exists, the controller returns the failure as a BulkResult, which
- * we still assert on (success=false, with a message). The structural
- * assertions — list shape, ordering, ownership filters — are valid either way.
+ * no process exists, the controller surfaces the failure as a BulkResult, and
+ * we still assert on the structural shape (per-record entries, ordering,
+ * ownership filters) which is valid either way.
  */
 @IsTest
 private class BulkApprovalControllerTest {
@@ -46,25 +46,64 @@ private class BulkApprovalControllerTest {
     }
 
     @IsTest
-    static void getSubmittableOpportunities_returnsOnlyOwnedOpps() {
+    static void getApprovalEnabledObjects_returnsList() {
+        Test.startTest();
+        List<BulkApprovalController.ApprovalObject> objs =
+            BulkApprovalController.getApprovalEnabledObjects();
+        Test.stopTest();
+
+        // The org may have no approval processes configured; we only assert
+        // that the call succeeds and returns a non-null list.
+        System.assertNotEquals(null, objs);
+    }
+
+    @IsTest
+    static void getSubmittableRecords_blankObjectThrows() {
+        Test.startTest();
+        Boolean threw = false;
+        try {
+            BulkApprovalController.getSubmittableRecords('', 10);
+        } catch (AuraHandledException e) {
+            threw = true;
+        }
+        Test.stopTest();
+        System.assert(threw, 'Blank objectApiName should throw');
+    }
+
+    @IsTest
+    static void getSubmittableRecords_unknownObjectThrows() {
+        Test.startTest();
+        Boolean threw = false;
+        try {
+            BulkApprovalController.getSubmittableRecords('NotARealObject__c', 10);
+        } catch (AuraHandledException e) {
+            threw = true;
+        }
+        Test.stopTest();
+        System.assert(threw, 'Unknown objectApiName should throw');
+    }
+
+    @IsTest
+    static void getSubmittableRecords_returnsOnlyOwnedRecords() {
         User testUser = createTestUser();
         List<Opportunity> mine;
         List<Opportunity> theirs;
         System.runAs(testUser) {
             mine = createOpportunities(testUser.Id, 3);
         }
-        // Other user's opps should not show up for testUser.
         theirs = createOpportunities(UserInfo.getUserId(), 2);
 
         Test.startTest();
-        List<BulkApprovalController.SubmittableOpportunity> rows;
+        BulkApprovalController.SubmittableData data;
         System.runAs(testUser) {
-            rows = BulkApprovalController.getSubmittableOpportunities(50);
+            data = BulkApprovalController.getSubmittableRecords('Opportunity', 50);
         }
         Test.stopTest();
 
+        System.assertEquals('Opportunity', data.objectApiName);
+        System.assertEquals(true, data.hasOwner);
         Set<Id> returnedIds = new Set<Id>();
-        for (BulkApprovalController.SubmittableOpportunity r : rows) {
+        for (BulkApprovalController.RecordRow r : data.rows) {
             returnedIds.add(r.id);
         }
         for (Opportunity o : mine) {
@@ -78,25 +117,23 @@ private class BulkApprovalControllerTest {
     }
 
     @IsTest
-    static void getSubmittableOpportunities_normalizesMaxRows() {
+    static void getSubmittableRecords_normalizesMaxRows() {
         User testUser = createTestUser();
         System.runAs(testUser) {
             createOpportunities(testUser.Id, 5);
         }
 
         Test.startTest();
-        List<BulkApprovalController.SubmittableOpportunity> none;
-        List<BulkApprovalController.SubmittableOpportunity> defaulted;
+        BulkApprovalController.SubmittableData none;
+        BulkApprovalController.SubmittableData defaulted;
         System.runAs(testUser) {
-            // null -> default
-            defaulted = BulkApprovalController.getSubmittableOpportunities(null);
-            // 0 / negative -> default
-            none = BulkApprovalController.getSubmittableOpportunities(0);
+            defaulted = BulkApprovalController.getSubmittableRecords('Opportunity', null);
+            none = BulkApprovalController.getSubmittableRecords('Opportunity', 0);
         }
         Test.stopTest();
 
-        System.assertEquals(5, defaulted.size());
-        System.assertEquals(5, none.size());
+        System.assertEquals(5, defaulted.rows.size());
+        System.assertEquals(5, none.rows.size());
     }
 
     @IsTest
@@ -132,8 +169,6 @@ private class BulkApprovalControllerTest {
         System.assertEquals(opps[0].Id, results[0].recordId);
         System.assertEquals(opps[1].Id, results[1].recordId);
         for (BulkApprovalController.BulkResult r : results) {
-            // success may be true (process exists) or false (no process configured).
-            // In the false branch we expect a non-null message.
             if (!r.success) {
                 System.assertNotEquals(null, r.message,
                     'Failed submissions should include an error message');
@@ -142,13 +177,16 @@ private class BulkApprovalControllerTest {
     }
 
     @IsTest
-    static void getMyPendingOpportunityApprovals_runsWithoutError() {
+    static void getMyPendingApprovals_runsWithoutError() {
         Test.startTest();
-        List<BulkApprovalController.PendingApprovalRow> rows =
-            BulkApprovalController.getMyPendingOpportunityApprovals();
+        List<BulkApprovalController.PendingApprovalRow> all =
+            BulkApprovalController.getMyPendingApprovals(null);
+        List<BulkApprovalController.PendingApprovalRow> filtered =
+            BulkApprovalController.getMyPendingApprovals('Opportunity');
         Test.stopTest();
 
-        System.assertNotEquals(null, rows);
+        System.assertNotEquals(null, all);
+        System.assertNotEquals(null, filtered);
     }
 
     @IsTest
@@ -181,8 +219,6 @@ private class BulkApprovalControllerTest {
 
     @IsTest
     static void processWorkitems_unknownIdReturnsFailure() {
-        // 04i is the prefix for ProcessInstanceWorkitem; this is a syntactically
-        // valid id that does not point to a real workitem.
         Id fakeWorkitemId = '04i000000000000AAA';
         List<Id> ids = new List<Id>{ fakeWorkitemId };
 
@@ -208,5 +244,13 @@ private class BulkApprovalControllerTest {
         System.assertEquals(null, ok.message);
         System.assertEquals(false, ng.success);
         System.assertEquals('oops', ng.message);
+    }
+
+    @IsTest
+    static void approvalObject_constructorSetsFields() {
+        BulkApprovalController.ApprovalObject ao =
+            new BulkApprovalController.ApprovalObject('Account', '取引先');
+        System.assertEquals('Account', ao.apiName);
+        System.assertEquals('取引先', ao.label);
     }
 }

@@ -1,5 +1,5 @@
 <template>
-    <lightning-card title="商談 一括申請" icon-name="standard:opportunity">
+    <lightning-card title="一括承認" icon-name="standard:approval">
         <div slot="actions">
             <lightning-button-icon
                 icon-name="utility:refresh"
@@ -15,32 +15,50 @@
                 <lightning-spinner alternative-text="処理中"></lightning-spinner>
             </template>
 
+            <div class="slds-p-bottom_small slds-size_1-of-2">
+                <lightning-combobox
+                    name="object"
+                    label="オブジェクト絞り込み"
+                    value={selectedObject}
+                    options={objectOptions}
+                    onchange={handleObjectChange}>
+                </lightning-combobox>
+            </div>
+
             <div class="slds-grid slds-gutters slds-wrap slds-p-bottom_small">
                 <div class="slds-col slds-size_1-of-1 slds-medium-size_2-of-3">
                     <lightning-textarea
-                        label="申請コメント"
+                        label="コメント"
                         value={comments}
                         onchange={handleCommentsChange}
                         max-length="1000"
-                        placeholder="承認者へのコメント（任意）">
+                        placeholder="承認/却下時のコメント（任意）">
                     </lightning-textarea>
                 </div>
-                <div class="slds-col slds-size_1-of-1 slds-medium-size_1-of-3 slds-grid slds-grid_vertical-align-end">
-                    <div class="slds-text-body_regular slds-p-right_medium">
+                <div class="slds-col slds-size_1-of-1 slds-medium-size_1-of-3 slds-grid slds-grid_vertical-align-end slds-wrap">
+                    <div class="slds-text-body_regular slds-p-right_medium slds-p-bottom_x-small">
                         {selectedCountLabel}
                     </div>
-                    <lightning-button
-                        label="一括申請"
-                        variant="brand"
-                        onclick={handleSubmit}
-                        disabled={submitDisabled}>
-                    </lightning-button>
+                    <lightning-button-group>
+                        <lightning-button
+                            label="一括承認"
+                            variant="success"
+                            onclick={handleApprove}
+                            disabled={actionDisabled}>
+                        </lightning-button>
+                        <lightning-button
+                            label="一括却下"
+                            variant="destructive"
+                            onclick={handleReject}
+                            disabled={actionDisabled}>
+                        </lightning-button>
+                    </lightning-button-group>
                 </div>
             </div>
 
             <template if:true={hasRows}>
                 <lightning-datatable
-                    key-field="id"
+                    key-field="workitemId"
                     data={rows}
                     columns={columns}
                     onrowselection={handleRowSelection}>
@@ -48,7 +66,7 @@
             </template>
             <template if:false={hasRows}>
                 <div class="slds-align_absolute-center slds-p-vertical_large slds-text-color_weak">
-                    申請可能な商談はありません。
+                    保留中の承認依頼はありません。
                 </div>
             </template>
 

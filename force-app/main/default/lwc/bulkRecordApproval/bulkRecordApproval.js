@@ -1,44 +1,68 @@
 import { LightningElement, track, wire } from 'lwc';
 import { refreshApex } from '@salesforce/apex';
 import { ShowToastEvent } from 'lightning/platformShowToastEvent';
-import getSubmittableOpportunities from '@salesforce/apex/BulkApprovalController.getSubmittableOpportunities';
-import submitForApproval from '@salesforce/apex/BulkApprovalController.submitForApproval';
+import getApprovalEnabledObjects from '@salesforce/apex/BulkApprovalController.getApprovalEnabledObjects';
+import getMyPendingApprovals from '@salesforce/apex/BulkApprovalController.getMyPendingApprovals';
+import processWorkitems from '@salesforce/apex/BulkApprovalController.processWorkitems';
+
+const ALL_VALUE = '__ALL__';
 
 const COLUMNS = [
-    { label: '商談名', fieldName: 'name', type: 'text', sortable: true },
-    { label: '取引先', fieldName: 'accountName', type: 'text' },
-    { label: 'フェーズ', fieldName: 'stageName', type: 'text' },
+    { label: 'オブジェクト', fieldName: 'objectLabel', type: 'text' },
+    { label: 'レコード名', fieldName: 'name', type: 'text' },
+    { label: '申請者', fieldName: 'submitterName', type: 'text' },
     {
-        label: '金額',
-        fieldName: 'amount',
-        type: 'currency',
-        cellAttributes: { alignment: 'right' }
-    },
-    { label: '完了予定日', fieldName: 'closeDate', type: 'date-local' },
-    { label: '所有者', fieldName: 'ownerName', type: 'text' }
+        label: '申請日時',
+        fieldName: 'submittedDate',
+        type: 'date',
+        typeAttributes: {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit'
+        }
+    }
 ];
 
-export default class BulkOpportunitySubmit extends LightningElement {
+export default class BulkRecordApproval extends LightningElement {
     columns = COLUMNS;
+    @track objectOptions = [{ label: 'すべて', value: ALL_VALUE }];
     @track rows = [];
     @track selectedIds = [];
     @track errors = [];
+    selectedObject = ALL_VALUE;
     comments = '';
     isLoading = false;
     wiredResult;
 
-    @wire(getSubmittableOpportunities, { maxRows: 200 })
-    wiredOpps(result) {
+    @wire(getApprovalEnabledObjects)
+    wiredObjects({ data, error }) {
+        if (data) {
+            this.objectOptions = [
+                { label: 'すべて', value: ALL_VALUE },
+                ...data.map((o) => ({
+                    label: `${o.label} (${o.apiName})`,
+                    value: o.apiName
+                }))
+            ];
+        } else if (error) {
+            this.objectOptions = [{ label: 'すべて', value: ALL_VALUE }];
+        }
+    }
+
+    get apiNameFilter() {
+        return this.selectedObject === ALL_VALUE ? null : this.selectedObject;
+    }
+
+    @wire(getMyPendingApprovals, { objectApiName: '$apiNameFilter' })
+    wiredApprovals(result) {
         this.wiredResult = result;
         if (result.data) {
             this.rows = result.data;
         } else if (result.error) {
             this.rows = [];
-            this.showToast(
-                'エラー',
-                this.reduceError(result.error),
-                'error'
-            );
+            this.showToast('エラー', this.reduceError(result.error), 'error');
         }
     }
 
@@ -50,7 +74,7 @@ export default class BulkOpportunitySubmit extends LightningElement {
         return this.selectedIds.length > 0;
     }
 
-    get submitDisabled() {
+    get actionDisabled() {
         return this.isLoading || !this.hasSelection;
     }
 
@@ -62,24 +86,44 @@ export default class BulkOpportunitySubmit extends LightningElement {
         return this.errors.length > 0;
     }
 
+    handleObjectChange(event) {
+        this.selectedObject = event.detail.value;
+        this.selectedIds = [];
+        this.errors = [];
+        this.comments = '';
+        const datatable = this.template.querySelector('lightning-datatable');
+        if (datatable) {
+            datatable.selectedRows = [];
+        }
+    }
+
     handleRowSelection(event) {
         const selected = event.detail.selectedRows || [];
-        this.selectedIds = selected.map((row) => row.id);
+        this.selectedIds = selected.map((row) => row.workitemId);
     }
 
     handleCommentsChange(event) {
         this.comments = event.target.value;
     }
 
-    async handleSubmit() {
+    handleApprove() {
+        return this.runAction('Approve', '一括承認結果');
+    }
+
+    handleReject() {
+        return this.runAction('Reject', '一括却下結果');
+    }
+
+    async runAction(action, toastTitle) {
         if (!this.hasSelection) {
             return;
         }
         this.isLoading = true;
         this.errors = [];
         try {
-            const results = await submitForApproval({
-                recordIds: this.selectedIds,
+            const results = await processWorkitems({
+                workitemIds: this.selectedIds,
+                action,
                 comments: this.comments
             });
             const successCount = results.filter((r) => r.success).length;
@@ -87,21 +131,22 @@ export default class BulkOpportunitySubmit extends LightningElement {
             this.errors = results
                 .filter((r) => !r.success)
                 .map((r) => {
-                    const opp = this.rows.find((row) => row.id === r.recordId);
+                    const row = this.rows.find(
+                        (x) => x.workitemId === r.recordId
+                    );
                     return {
                         id: r.recordId,
-                        label: opp ? opp.name : r.recordId,
+                        label: row ? `${row.objectLabel}: ${row.name}` : r.recordId,
                         message: r.message
                     };
                 });
 
             this.showToast(
-                '一括申請結果',
+                toastTitle,
                 `成功 ${successCount} 件 / 失敗 ${failureCount} 件`,
                 failureCount === 0 ? 'success' : 'warning'
             );
 
-            // Clear selection on the datatable.
             const datatable = this.template.querySelector('lightning-datatable');
             if (datatable) {
                 datatable.selectedRows = [];
@@ -127,9 +172,7 @@ export default class BulkOpportunitySubmit extends LightningElement {
     }
 
     reduceError(error) {
-        if (!error) {
-            return '不明なエラー';
-        }
+        if (!error) return '不明なエラー';
         if (Array.isArray(error.body)) {
             return error.body.map((e) => e.message).join(', ');
         }
